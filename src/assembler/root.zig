@@ -1,21 +1,48 @@
+const CodeGenerationError = error{
+    UnexpectedToken,
+    OutOfTokens,
+};
+
+const TokenizerError = error{
+    InvalidToken,
+};
+
 const Token = struct {
     line: usize,
     column: usize,
     value: Value,
 
+    const Mnemonic = union(enum) {
+        alu: Alu,
+        mem: Mem,
+        const Alu = enum { add, sub, xor, brs, @"and", nand, nor, @"or", mov };
+        const Mem = enum { blod, bstr, hlod, hstr, lod, str };
+    };
+    const ShiftType = enum { lsl, lsr, asr, ror };
+    const RegisterAliases = enum(u5) {
+        zr = 0,
+        pc = 1,
+    };
+    const Directive = enum {
+        byte,
+    };
+
     const Value = union(enum) {
         mnemonic: Mnemonic,
         register: u5,
         immediate: u24,
+        number: u32,
         shift_type: ShiftType,
         symbol: enum { comma },
+        directive: Directive,
 
         fn fromString(str: []const u8) !Value {
             // std.debug.print("token: {s}\n", .{str});
             return parseMnemonic(str) orelse
                 pasreShiftType(str) orelse
                 parseRegister(str) orelse
-                AssembleError.InvalidToken;
+                parseDirective(str) orelse
+                TokenizerError.InvalidToken;
         }
 
         fn parseMnemonic(str: []const u8) ?Value {
@@ -47,47 +74,39 @@ const Token = struct {
             };
         }
 
+        fn parseDirective(str: []const u8) ?Value {
+            if (str.len < 1 or str[0] != '.') {
+                return null;
+            }
+            if (std.meta.stringToEnum(Token.Directive, str[1..])) |value|
+                return .{ .directive = value };
+            return null;
+        }
+
         fn isComma(self: Value) bool {
             return self == .symbol and self.symbol == .comma;
         }
     };
-
-    const Mnemonic = union(enum) {
-        alu: Alu,
-        mem: Mem,
-        const Alu = enum { add, sub, xor, brs, @"and", nand, nor, @"or" };
-        const Mem = enum { str, lod, hstr, hlod, bstr, blod };
-    };
-    const ShiftType = enum { lsl, lsr, asr, ror };
-    const RegisterAliases = enum(u5) {
-        zr = 0,
-        pc = 1,
-    };
 };
 
-fn readAlphabetCharString(str: []const u8) []const u8 {
+fn readAlphaNumericalString(str: []const u8) []const u8 {
     for (str, 0..) |char, i| {
         switch (char) {
-            'A'...'Z', 'a'...'z', '0'...'9' => {},
+            'A'...'Z', 'a'...'z', '0'...'9', '.', '_' => {},
             else => return str[0..i],
         }
     }
     return str;
 }
 
-fn readImmediateString(str: []const u8) !struct { u24, usize } {
-    var number_string = str;
+fn readNumericalString(str: []const u8) !struct { u32, usize } {
     for (str, 0..) |char, i| {
-        switch (char) {
-            '0'...'9', '_' => {},
-            else => {
-                number_string = str[0..i];
-                break;
-            },
+        switch (std.ascii.toLower(char)) {
+            '0'...'9', '_', 'a'...'f', 'o', 'x' => {},
+            else => return .{ try std.fmt.parseInt(u32, str[0..i], 0), i },
         }
     }
-    const number = try std.fmt.parseInt(u24, number_string, 0);
-    return .{ number, number_string.len };
+    return .{ try std.fmt.parseInt(u32, str, 0), str.len };
 }
 
 fn tokenize(source: []const u8) ![]Token {
@@ -98,8 +117,8 @@ fn tokenize(source: []const u8) ![]Token {
         var column: usize = 0;
         while (column < line.len) {
             switch (line[column]) {
-                'A'...'Z', 'a'...'z' => {
-                    const token_string = readAlphabetCharString(line[column..]);
+                'A'...'Z', 'a'...'z', '.', '_' => {
+                    const token_string = readAlphaNumericalString(line[column..]);
                     const token: Token = .{
                         .line = line_number,
                         .column = column,
@@ -108,12 +127,21 @@ fn tokenize(source: []const u8) ![]Token {
                     column += @as(usize, token_string.len);
                     try tokens.append(token);
                 },
-                '#' => {
-                    const number, const num_len = try readImmediateString(line[column + 1 ..]);
+                '0'...'9' => {
+                    const number, const num_len = try readNumericalString(line[column..]);
                     try tokens.append(.{
                         .line = line_number,
                         .column = column,
-                        .value = .{ .immediate = number },
+                        .value = .{ .number = number },
+                    });
+                    column += num_len;
+                },
+                '#' => {
+                    const number, const num_len = try readNumericalString(line[column + 1 ..]);
+                    try tokens.append(.{
+                        .line = line_number,
+                        .column = column,
+                        .value = .{ .immediate = @intCast(number) },
                     });
                     column += num_len + 1;
                 },
@@ -127,7 +155,7 @@ fn tokenize(source: []const u8) ![]Token {
                 },
                 ' ', '\t' => column += 1,
                 ';' => break,
-                else => return AssembleError.InvalidToken,
+                else => return TokenizerError.InvalidToken,
             }
         }
         line_number += 1;
@@ -135,20 +163,19 @@ fn tokenize(source: []const u8) ![]Token {
     return tokens.items;
 }
 
-const CodeGenerationError = error{
-    UnexpectedToken,
-    OutOfTokens,
-};
-
 const TokenIterator = struct {
     slice: []const Token,
     index: usize = 0,
-    fn next(self: *@This()) !*const Token {
+    fn peek(self: *@This()) !*const Token {
         if (self.index >= self.slice.len) {
             return CodeGenerationError.OutOfTokens;
         }
-        self.index += 1;
-        return &self.slice[self.index - 1];
+        return &self.slice[self.index];
+    }
+
+    fn next(self: *@This()) !*const Token {
+        defer self.index += 1;
+        return try self.peek();
     }
 };
 
@@ -162,15 +189,20 @@ fn generateAluInstruction(mnemonic: Token.Mnemonic.Alu, tokens: *TokenIterator) 
         .nand => .nand,
         .nor => .nor,
         .@"or" => .@"or",
-        // .mov => .add,
+        .mov => .add,
     };
-    const prim_op_reg = switch ((try tokens.next()).value) {
-        .register => |register| register,
-        else => return CodeGenerationError.UnexpectedToken,
+    const prim_op_reg = if (mnemonic == .mov) blk: {
+        break :blk 0;
+    } else blk: {
+        const reg = switch ((try tokens.next()).value) {
+            .register => |register| register,
+            else => return CodeGenerationError.UnexpectedToken,
+        };
+        if (!(try tokens.next()).value.isComma()) {
+            return CodeGenerationError.UnexpectedToken;
+        }
+        break :blk reg;
     };
-    if (!(try tokens.next()).value.isComma()) {
-        return CodeGenerationError.UnexpectedToken;
-    }
     const sec_op_value_to_shift: u8, const is_sec_op_reg = switch ((try tokens.next()).value) {
         .immediate => |immediate| .{ @intCast(immediate), false },
         .register => |register| .{ @intCast(register), true },
@@ -205,20 +237,37 @@ fn generateAluInstruction(mnemonic: Token.Mnemonic.Alu, tokens: *TokenIterator) 
 }
 
 fn generateBinaryFromTokens(tokens: []const Token) ![]u8 {
-    var output = std.ArrayList(u32).init(allocator);
+    var output = std.ArrayList(u8).init(allocator);
     var token_iter: TokenIterator = .{ .slice = tokens };
     while (true) {
         const token = token_iter.next() catch {
             break;
         };
         switch (token.value) {
-            .mnemonic => |mnemonic| {
-                switch (mnemonic) {
-                    .alu => |alu_mnemonic| {
-                        try output.append(@bitCast(try generateAluInstruction(alu_mnemonic, &token_iter)));
-                    },
-                    else => {},
-                }
+            .mnemonic => |mnemonic| switch (mnemonic) {
+                .alu => |alu_mnemonic| {
+                    // try output.addManyAsArray(4);
+                    const instr = try generateAluInstruction(alu_mnemonic, &token_iter);
+                    std.mem.writeInt(u32, try output.addManyAsArray(4), @bitCast(instr), std.builtin.Endian.little);
+                },
+                else => {},
+            },
+            .directive => |directive| switch (directive) {
+                .byte => {
+                    while ((token_iter.peek() catch {
+                        break;
+                    }).value == .number) {
+                        try output.append(@intCast((try token_iter.next()).value.number));
+                        const next_token = (token_iter.peek() catch {
+                            break;
+                        }).value;
+                        if (next_token == .symbol and next_token.symbol == .comma) {
+                            _ = try token_iter.next();
+                        } else {
+                            break;
+                        }
+                    }
+                },
             },
             else => return CodeGenerationError.UnexpectedToken,
         }
@@ -230,10 +279,6 @@ pub fn assemble(source: []const u8) ![]u8 {
     const tokens = try tokenize(source);
     return try generateBinaryFromTokens(tokens);
 }
-
-const AssembleError = error{
-    InvalidToken,
-};
 
 const std = @import("std");
 const instructions = @import("instructions");

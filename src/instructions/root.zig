@@ -19,40 +19,38 @@ pub const AluOpcode = enum(u3) {
 };
 
 pub const MemOpcode = enum(u3) {
-    str = 0, // Store, 32bit
-    lod = 1, // Load
-    hstr = 2, // 16bit
-    hlod = 3,
-    bstr = 4, // 8 bit
-    blod = 5,
+    blod = 0, // Load, 8bit
+    bstr = 1, // Store
+    hlod = 2, // 16bit
+    hstr = 3,
+    lod = 4, // 32 bit
+    str = 5,
     _,
 };
 
 pub const Instruction = packed struct {
-    type: InstructionType,
     payload: packed union {
         s_format: SFormat,
     },
+    type: InstructionType,
 
     /// Used for alu and mem operations
     pub const SFormat = packed struct(u27) {
-        opcode: u3,
-        /// Source, or destination reg
-        target_reg: u5,
-        primary_operand_reg: u5,
-        shift_source_is_register: bool,
         secondary_operand: SecondaryOperand,
-
+        shift_source_is_register: bool,
+        primary_operand_reg: u5,
+        target_reg: u5,
+        opcode: u3,
         pub const SecondaryOperand = packed union {
             imm: packed struct {
-                shift_by: u5, // Always imm, shift type is ror
                 value_to_shift: u8,
+                shift_by: u5, // Always imm, shift type is ror
             },
             reg: packed struct {
-                shift_by: u5, // Imm, or reg
-                is_shifted_by_reg: bool,
-                shift_type: ShiftType,
                 value_to_shift_reg: u5,
+                shift_type: ShiftType,
+                is_shifted_by_reg: bool,
+                shift_by: u5, // Imm, or reg
             },
         };
 

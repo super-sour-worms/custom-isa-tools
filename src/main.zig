@@ -23,7 +23,7 @@ pub fn main() !u8 {
         .execute => {
             var core: emulator.CpuCore = .init();
             @memcpy(core.memory[0..binary.len], binary);
-            core.memory[@as(usize, @intCast(binary.len))] = 248;
+            core.memory[binary.len + 3] = 248;
             core.run() catch |err| {
                 std.debug.print("Error: {!}\n", .{err});
             };
