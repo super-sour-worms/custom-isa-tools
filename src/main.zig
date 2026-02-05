@@ -1,59 +1,60 @@
 pub fn main() !u8 {
     defer _ = debug_allocator.deinit();
-
     const parsed_args = try args.parseWithVerbForCurrentProcess(struct {}, union(enum) {
         assemble: struct {
             output: []const u8 = "a.bin",
             pub const shorthands = .{ .o = "output" };
         },
         execute: struct {},
-    }, allocator, .silent);
+    }, alloc, .silent);
     defer parsed_args.deinit();
     if (parsed_args.positionals.len < 1) {
-        std.debug.print("Error: excepted file to assemble as an positional argument\n", .{});
+        log.err("excepted file to assemble as an positional argument\n", .{});
         return 1;
     }
-    const assembler_source = try readFile(parsed_args.positionals[0]);
-    defer allocator.free(assembler_source);
-    const binary = try assembler.assemble(assembler_source);
+
+    var source_file = try std.fs.cwd().openFile(parsed_args.positionals[0], .{});
+    defer source_file.close();
+    var reader = source_file.reader(&[_]u8{});
+    const assembler_source = try reader.interface.allocRemaining(alloc, .unlimited);
+
+    defer alloc.free(assembler_source);
+    var binary = try assembler.assemble(alloc, assembler_source, parsed_args.positionals[0]);
+    defer binary.deinit(alloc);
     switch (parsed_args.verb.?) {
         .assemble => |verb| {
-            try writeFile(verb.output, binary);
+            var file = try std.fs.cwd().createFile(verb.output, .{});
+            defer file.close();
+            var writer = file.writer(&[_]u8{});
+            try writer.interface.writeAll(binary.items);
         },
         .execute => {
-            var core: emulator.CpuCore = .init();
-            @memcpy(core.memory[0..binary.len], binary);
-            core.memory[binary.len + 3] = 248;
-            core.run() catch |err| {
-                std.debug.print("Error: {!}\n", .{err});
-            };
-            try stdout.print("reg dump: {x:08}\n", .{core.global_regs});
-            try stdout.print("mem dump: {x:02}\n", .{core.memory});
+            var core: emulator.CpuCore = .{};
+            @memcpy(core.memory[0..binary.items.len], binary.items);
+            core.memory[binary.items.len + 3] = 0xf8;
+            try core.run(alloc);
+            log.info("Registers 1-7 dump:", .{});
+            for (core.regs[1..8], 1..) |reg, i| {
+                log.info("    ({x:08})<r{d}>", .{ reg, i });
+            }
+            var mem_dump: std.Io.Writer.Allocating = try .initCapacity(alloc, 3 * 48);
+            defer mem_dump.deinit();
+            for (core.memory[0..32]) |byte| {
+                try mem_dump.writer.print("{x:02} ", .{byte});
+            }
+            log.info("Memory ..32 dump: {s}", .{mem_dump.written()});
         },
     }
     return 0;
 }
 
-fn readFile(path: []const u8) ![]const u8 {
-    var file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const file_size = (try file.metadata()).size();
-    const source_buffer = try allocator.alloc(u8, file_size);
-    _ = try file.readAll(source_buffer);
-    return source_buffer;
-}
-
-fn writeFile(path: []const u8, data: []const u8) !void {
-    var file: std.fs.File = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(data);
-}
-
 const std = @import("std");
+const log = std.log;
+
+const args = @import("args");
+
 const emulator = @import("emulator");
 const assembler = @import("assembler");
-const args = @import("args");
-const stdin = std.io.getStdIn().reader();
-const stdout = std.io.getStdOut().writer();
+
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-const allocator = debug_allocator.allocator();
+const alloc = debug_allocator.allocator();

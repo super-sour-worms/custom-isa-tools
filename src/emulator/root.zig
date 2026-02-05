@@ -1,120 +1,220 @@
-const std = @import("std");
-const builtin = std.builtin;
-const instructions = @import("instructions");
-const Instruction = instructions.Instruction;
-
 pub const CpuCore = struct {
-    global_regs: [8]u32 = [_]u32{0} ** 8,
-    memory: [64]u8 align(4) = undefined,
+    regs: [32]u32 = [_]u32{0} ** 32,
+    memory: [1024]u8 align(4) = undefined,
+    pc_modified: bool = false,
 
-    const RegIndex = enum(u5) {
-        zr = 0, // Zero register
-        pc = 1, // Program counter
-        sp = 2, // Stack pointer
-        bp = 3, // Base pointer
-        _,
-    };
-
-    pub fn init() CpuCore {
-        return .{};
-    }
-
-    pub fn run(self: *CpuCore) !void {
+    pub fn run(self: *CpuCore, alloc: Allocator) !void {
         while (true) {
-            try self.executeNextInstruction();
+            self.executeNextInstruction(alloc) catch |err| switch (err) {
+                error.UnimplementedInstruction => return,
+                else => return err,
+            };
         }
     }
 
     pub const CpuError = error{
-        UnimplementedInstruction,
         InvalidInstruction,
         InvalidMemoryAccess,
     };
 
-    pub fn executeNextInstruction(self: *CpuCore) !void {
-        const pc = self.getRegister(.pc);
-        const raw_instr = std.mem.bytesToValue(u32, self.memory[pc .. pc + 4]);
+    pub fn executeNextInstruction(self: *CpuCore, alloc: Allocator) !void {
+        const raw_instr = mem.bytesToValue(u32, self.memory[self.regs[1] .. self.regs[1] + 4]);
+        self.pc_modified = false;
         const instr: Instruction = @bitCast(raw_instr);
-        // std.debug.print("instr: {x}\n", .{instr});
         switch (instr.type) {
-            .alu => self.executeAluInstruction(instr.payload.s_format),
-            .mem => try self.executeMemInstruction(instr.payload.s_format),
-            else => return CpuError.UnimplementedInstruction,
+            .alu => try self.executeAluInstruction(alloc, instr.payload),
+            .mem => try self.executeMemInstruction(instr.payload.s_or_m_format),
+            .cjmp => try self.executeCJmpInstruction(instr.payload.cj_format),
+            .ljmp => try self.executeLJmpInstruction(instr.payload.lj_format),
+            else => return error.UnimplementedInstruction,
         }
-        self.setRegister(.pc, self.getRegister(.pc) +% 4);
+        if (!self.pc_modified) {
+            self.regs[1] +%= 4;
+        }
     }
 
-    fn executeAluInstruction(self: *CpuCore, instr: Instruction.SFormat) void {
-        const op1, const op2 = self.getSFormatOps(instr);
-        std.debug.print("Alu instruction: op1={}, op2={}, dest={}\n", .{ op1, op2, instr.target_reg });
-        const result = switch (@as(instructions.AluOpcode, @enumFromInt(instr.opcode))) {
-            .add => op1 +% op2,
-            .sub => op1 -% op2,
-            .xor => op1 ^ op2,
-            .brs => op1 & ~op2,
-            .@"and" => op1 & op2,
-            .nand => ~(op1 & op2),
-            .nor => ~(op1 | op2),
-            .@"or" => op1 | op2,
-        };
-        self.setRegister(@enumFromInt(instr.target_reg), result);
+    fn executeAluInstruction(self: *CpuCore, alloc: Allocator, instr: Instruction.Payload) !void {
+        const s: instructions.Instruction.SOrMFormat = @bitCast(instr);
+        if (s.target == .zr) {
+            const lm: instructions.Instruction.LMFormat = @bitCast(instr);
+            const half: u32 = lm.imm_low | @as(u16, @intCast(lm.imm_high)) << 14;
+            const new_value = if (lm.is_high_half)
+                (self.getRegister(lm.target) & 0x0000_FFFF) | (half << 16)
+            else
+                (self.getRegister(lm.target) & 0xFFFF_0000) | half;
+            self.setRegister(lm.target, new_value);
+        } else {
+            const op1 = self.getRegister(s.primary);
+            const op2 = self.getSFormatSecondary(s);
+            const result = switch (@as(instructions.AluOpcode, @enumFromInt(s.opcode))) {
+                .add => op1 +% op2,
+                .sub => op1 -% op2,
+                .xor => op1 ^ op2,
+                .brs => op1 & ~op2,
+                .@"and" => op1 & op2,
+                .nand => ~(op1 & op2),
+                .nor => ~(op1 | op2),
+                .@"or" => op1 | op2,
+            };
+
+            // TODO: make instruction info formating easier
+            const dumpLineBegnning = try std.fmt.allocPrint(alloc, "{t} <{t}>({d}), ({d})<{t}>, ({d})", .{
+                @as(instructions.AluOpcode, @enumFromInt(s.opcode)),
+                s.target,
+                result,
+                op1,
+                s.primary,
+                op2,
+            });
+            defer alloc.free(dumpLineBegnning);
+            if (s.secondary_is_register) {
+                const reg = s.secondary.reg;
+                if (reg.is_shifted_by_reg)
+                    log.info("{s}<{t} {t} {t}>", .{
+                        dumpLineBegnning,
+                        reg.value_to_shift,
+                        reg.shift_type,
+                        reg.shift_by.reg,
+                    })
+                else
+                    log.info("{s}<{t} {t} {d}>", .{
+                        dumpLineBegnning,
+                        reg.value_to_shift,
+                        reg.shift_type,
+                        reg.shift_by.imm,
+                    });
+            } else {
+                const imm = s.secondary.s_format_imm;
+                log.info("{s}<{d} rol {d}>", .{
+                    dumpLineBegnning,
+                    imm.value_to_shift,
+                    imm.shift_by,
+                });
+            }
+
+            self.setRegister(s.target, result);
+        }
     }
 
-    fn executeMemInstruction(self: *CpuCore, instr: Instruction.SFormat) !void {
-        const op1, const op2 = self.getSFormatOps(instr);
-        const addr = op1 + op2;
-        const opcode: packed struct(u3) {
+    fn executeMemInstruction(self: *CpuCore, instr: Instruction.SOrMFormat) !void {
+        const addr = self.getRegister(instr.primary) +% self.getMFormatSecondary(instr);
+        const opcode: struct {
             is_store: bool,
-            size: enum(u2) { byte = 0, half = 1, word = 2, _ },
-        } = @bitCast(instr.opcode);
+            size: enum(u2) { @"1", @"2", @"4" },
+        } = switch (@as(instructions.MemOpcode, @enumFromInt(instr.opcode))) {
+            .str1 => .{ .is_store = true, .size = .@"1" },
+            .lod1 => .{ .is_store = false, .size = .@"1" },
+            .str2 => .{ .is_store = true, .size = .@"2" },
+            .lod2 => .{ .is_store = false, .size = .@"2" },
+            .str4 => .{ .is_store = true, .size = .@"4" },
+            .lod4 => .{ .is_store = false, .size = .@"4" },
+            else => return error.Unimplemented,
+        };
+        // if (opcode.is_store) {
+        //     log.info("Store: addr={}, target={}", .{ addr, instr.target });
+        // } else {
+        //     log.info("Load: addr={}, target={}", .{ addr, instr.target });
+        // }
         if (opcode.is_store) {
-            std.debug.print("Store {s} instruction: source={}, base={}, offset={}\n", .{ @tagName(opcode.size), instr.target_reg, op1, op2 });
-            const val = self.getRegister(@enumFromInt(instr.target_reg));
+            const val = self.getRegister(instr.target);
+            log.info("str{t}: ({d})<{t}>, [({x})]", .{ opcode.size, val, instr.target, addr });
             switch (opcode.size) {
-                .byte => self.memory[addr] = @intCast(val),
-                .half => std.mem.writeInt(u16, @ptrCast(&self.memory[addr]), @intCast(val), std.builtin.Endian.little),
-                .word => std.mem.writeInt(u32, @ptrCast(&self.memory[addr]), val, std.builtin.Endian.little),
-                else => return CpuError.InvalidInstruction,
+                .@"1" => self.memory[addr] = @intCast(val),
+                .@"2" => mem.writeInt(u16, @ptrCast(&self.memory[addr]), @intCast(val), .little),
+                .@"4" => mem.writeInt(u32, @ptrCast(&self.memory[addr]), val, .little),
             }
         } else {
-            std.debug.print("Load {s} instruction: base={}, offset={}, dest={}\n", .{ @tagName(opcode.size), op1, op2, instr.target_reg });
             const val = switch (opcode.size) {
-                .byte => self.memory[addr],
-                .half => std.mem.readInt(u16, @ptrCast(&self.memory[addr]), std.builtin.Endian.little),
-                .word => std.mem.readInt(u32, @ptrCast(&self.memory[addr]), std.builtin.Endian.little),
-                else => return CpuError.InvalidInstruction,
+                .@"1" => self.memory[addr],
+                .@"2" => mem.readInt(u16, @ptrCast(&self.memory[addr]), .little),
+                .@"4" => mem.readInt(u32, @ptrCast(&self.memory[addr]), .little),
             };
-            self.setRegister(@enumFromInt(instr.target_reg), val);
+            log.info("lod{t}: <{t}>({d}), [({x})]", .{ opcode.size, instr.target, val, addr });
+            self.setRegister(instr.target, val);
         }
     }
 
-    fn getSFormatOps(self: *CpuCore, instr: Instruction.SFormat) struct { u32, u32 } {
-        const op1 = self.getRegister(@enumFromInt(instr.primary_operand_reg));
-        if (instr.shift_source_is_register) {
-            const shift = instr.secondary_operand.reg;
-            const value_to_shift = self.getRegister(@enumFromInt(shift.value_to_shift_reg));
+    fn executeCJmpInstruction(self: *CpuCore, instr: Instruction.CJFormat) !void {
+        const op1 = self.getRegister(instr.comparand1);
+        const op2 = self.getRegister(instr.comparand2);
+        if (try compareTwoComparands(instr.condition, op1, op2)) {
+            const addr: i16 = @as(i16, @intCast(instr.pc_offset)) << 2;
+            self.regs[1] +%= @as(u32, @intCast(addr));
+            self.pc_modified = true;
+        }
+    }
+
+    fn executeLJmpInstruction(self: *CpuCore, instr: Instruction.LJFormat) !void {
+        self.setRegister(instr.link_reg, self.getRegister(.pc) + 4);
+        self.regs[1] = self.getRegister(instr.base_reg) +% @as(u32, @intCast(instr.offset));
+        self.pc_modified = true;
+    }
+
+    fn compareTwoComparands(condition: instructions.Condition, a: u32, b: u32) !bool {
+        return switch (condition) {
+            .eq => a == b,
+            .neq => a != b,
+            .sles => @as(i32, @intCast(a)) < @as(i32, @intCast(b)),
+            .sleq => @as(i32, @intCast(a)) <= @as(i32, @intCast(b)),
+            .ules => a < b,
+            .uleq => a <= b,
+            else => return CpuError.InvalidInstruction,
+        };
+    }
+
+    fn getSFormatSecondary(self: *CpuCore, instr: Instruction.SOrMFormat) u32 {
+        if (instr.secondary_is_register) {
+            const shift = instr.secondary.reg;
+            const value_to_shift = self.getRegister(shift.value_to_shift);
             const shift_by = if (shift.is_shifted_by_reg)
-                self.getRegister(@enumFromInt(shift.shift_by))
+                self.getRegister(shift.shift_by.reg)
             else
-                shift.shift_by;
-            return .{ op1, switch (shift.shift_type) {
-                .lsl => std.math.shl(u32, value_to_shift, shift_by),
-                .lsr => std.math.shr(u32, value_to_shift, shift_by),
-                .asr => @as(u32, @intCast(std.math.shr(i32, @intCast(value_to_shift), shift_by))),
-                .ror => std.math.rotr(u32, value_to_shift, shift_by),
-            } };
+                shift.shift_by.imm;
+            return switch (shift.shift_type) {
+                .lsl => math.shl(u32, value_to_shift, shift_by),
+                .lsr => math.shr(u32, value_to_shift, shift_by),
+                .asr => @as(u32, @intCast(math.shr(i32, @intCast(value_to_shift), shift_by))),
+                .rol => math.rotl(u32, value_to_shift, shift_by),
+            };
         } else {
-            const shift = instr.secondary_operand.imm;
-            return .{ op1, std.math.rotr(u32, shift.value_to_shift, shift.shift_by) };
+            const shift = instr.secondary.s_format_imm;
+            return math.rotl(u32, shift.value_to_shift, shift.shift_by);
         }
     }
 
-    fn getRegister(self: *CpuCore, reg: RegIndex) u32 {
-        return if (reg == .zr) 0 else self.global_regs[@intFromEnum(reg)];
+    fn getMFormatSecondary(self: *CpuCore, instr: Instruction.SOrMFormat) u32 {
+        if (instr.secondary_is_register) {
+            const shift = instr.secondary.reg;
+            const value_to_shift = self.getRegister(shift.value_to_shift);
+            const shift_by = if (shift.is_shifted_by_reg)
+                self.getRegister(shift.shift_by.reg)
+            else
+                shift.shift_by.imm;
+            return switch (shift.shift_type) {
+                .lsl => math.shl(u32, value_to_shift, shift_by),
+                .lsr => math.shr(u32, value_to_shift, shift_by),
+                .asr => @as(u32, @intCast(math.shr(i32, @intCast(value_to_shift), shift_by))),
+                .rol => math.rotl(u32, value_to_shift, shift_by),
+            };
+        } else return @bitCast(@as(i32, @intCast(instr.secondary.m_format_imm)));
     }
 
-    fn setRegister(self: *CpuCore, reg: RegIndex, val: u32) void {
-        if (reg == .zr) return;
-        self.global_regs[@intFromEnum(reg)] = val;
+    fn getRegister(self: *CpuCore, reg: instructions.Register) u32 {
+        return if (reg == .zr) 0 else self.regs[@intFromEnum(reg)];
+    }
+
+    fn setRegister(self: *CpuCore, reg: instructions.Register, val: u32) void {
+        if (reg == .zr or reg == .pc) return;
+        self.regs[@intFromEnum(reg)] = val;
     }
 };
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const builtin = std.builtin;
+const mem = std.mem;
+const math = std.math;
+const log = std.log;
+
+const instructions = @import("instructions");
+const Instruction = instructions.Instruction;
