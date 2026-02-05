@@ -1,0 +1,49 @@
+r0 - zero, r1 - pc (read only, executed instruction address)
+there is no negative-zero-overflow-carry flags
+
+Each implementation is free to implement undefined behaviours as it wants. Those are just general recomendations. Software developers should not
+assume that those are followed. Implementation developers are encouraged to document each divergence with RUB.
+    Recomended Undefined Behaviour Class 1: disallow in assembler; warn in debug emulation, treat as usual in hardware
+    Recomended Undefined Behaviour Class 2: disallow in assembler; unpredictable, or invalid instruction exception in implementations
+
+instruction formats:
+    |..3 ..................2 ..................1 ..................0|
+    |1_0_9_8_7_6_5_4_3_2_1_0_9_8_7_6_5_4_3_2_1_0_9_8_7_6_5_4_3_2_1_0|
+
+alu, lmov:
+    |0_0_0_0_0|AluOp|TargetReg|_Op1Reg__|_Op2SFormatShift___________| AluOp (S Format)
+    |0_0_0_0_0|H|IHi|0_0_0_0_0|TargetReg|_ImmLow____________________| LMov *note: IHi stands for Immediate High (bits 14 and 15)
+    note: alu ops: add, sub, xor, bcr (bit clear), and, nand, nor, or
+
+mem:
+    |0_0_0_0_1|Len|L|TargetReg|_Op1Reg__|_Op2SFormatShift___________| MemOp (M Format)
+    |0_0_0_0_1|_______________|_Op1Reg__|0_0_0_0_0_0_0_0_0_0_0_0_0_0| Improper Encoding if (Op1Reg != zr) (RUB Class 1)
+    |0_0_0_0_1_1_1|L|_AddrReg_|P|U|W|_RegistersMask_________________| BlockMemOp (could be an extension)
+    note: loads are always sign extended. zero extension is possible by pseudo instructions "zext.8" and "zext.16".
+          they are transformed to or "and rd, rd, 255" for 8 bit, "movh rd, 0" for 16 bit
+
+relative jumps:
+    |0_0_0_1_0|Cond_|Comp1Reg_|Comp2Reg_|_PcRelativeOffset__________| RJump (RJ Format)
+    |0_0_0_1_0_1_1|_________________________________________________| Undef (RUB Class 2)
+    note: conditions: ==, !=, signed <, signed <=, unsigned <, unsigned <=
+
+long jump:
+    |0_0_0_1_1|_RelativeOffset__________________|_LinkReg_|_BaseReg_| LJump (LJ Format)
+    note: maybe remove explicit linkreg field to get +-4MiB range instead of  +-256KiB
+
+formats:
+    |InstrCode|SubOp|TargetReg|_Op1Reg__|0|ShiftImm_|_BaseValueImm__| S Format, valid if (baseimm==shiftimm==0 || baseimm!=0), else RUB Class 1
+    |InstrCode|SubOp|TargetReg|_Op1Reg__|1|ShiftImm_|Typ|0|_BaseReg_| S Format, valid if (basereg!=zr) else RUB Class 1
+    |InstrCode|SubOp|TargetReg|_Op1Reg__|1|ShiftReg_|Typ|1|_BaseReg_| S Format, valid if (basereg!=zr && shiftreg!=zr) else RUB Class 1
+    note: shift ops: shift left, logical shift right, arithmetical shift right, rotate left
+
+    |InstrCode|SubOp|TargetReg|_Op1Reg__|0|_OffsetImmediate_________| M Format, same as S Format, except offset is signed 14 bit immediate without shift
+    |InstrCode|SubOp|TargetReg|_Op1Reg__|1|ShiftImm_|Typ|0|_BaseReg_| M Format, exactly the same as S Format
+    |InstrCode|SubOp|TargetReg|_Op1Reg__|1|ShiftReg_|Typ|1|_BaseReg_| M Format, exactly the same as S Format
+    note: shift ops: shift left, logical shift right, arithmetical shift right, rotate left
+
+    |_InstrCode___|L|_AddrReg_|P|U|W|_RegistersMask_________________| BM Format valid if (RegisterMask != 0) else RUB Class 1
+
+    |InstrCode|Cond_|Comp1Reg_|Comp2Reg_|_PcRelativeOffset__________| RJ Format, valid if (comp1!=comp2) || (comp1==comp2==zr && cond==eq) else RUB Class 1
+
+    |0_0_0_1_1|_RelativeOffset__________________|_LinkReg_|_BaseReg_| LJ Format
