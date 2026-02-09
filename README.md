@@ -25,4 +25,4 @@ Default output file is _a.bin_.
 isa-tools execute a.asm
 ```
 
-I have not implemented running binaries directly.
+I did not implemented running binaries directly.
